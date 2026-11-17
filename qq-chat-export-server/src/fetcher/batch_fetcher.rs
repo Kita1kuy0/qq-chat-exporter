@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -212,6 +212,12 @@ pub enum FetchError {
     /// 底层 API 错误。
     #[error("{0}")]
     Api(String),
+    /// 原生消息查询返回非零结果码。
+    #[error("原生消息查询失败 result={code}: {detail}")]
+    NativePage { code: i64, detail: String },
+    /// 查询响应缺少有效的消息列表。
+    #[error("{0}")]
+    InvalidPage(&'static str),
     /// 主动修复未取得进展。
     #[error(
         "MESSAGE_SEQUENCE_REPAIR_NO_PROGRESS: 群聊历史仍有 {gap_count} 个大序列缺口（估算缺失 {missing_positions} 个序号）"
@@ -258,6 +264,26 @@ impl FetchError {
                 lower.contains("timeout") || message.contains("API调用超时")
             }
             _ => false,
+        }
+    }
+
+    /// 返回需要冷却重试的原生查询错误原因。
+    fn native_retry_reason(&self) -> Option<&'static str> {
+        let Self::NativePage { code, detail } = self else {
+            return None;
+        };
+        // QQ Worker 也可在 result=-1 的 errMsg 开头携带实际错误码。
+        let (code, detail) = if *code == -1 {
+            let (code, detail) = detail.split_once(':')?;
+            (code.trim().parse::<i64>().ok()?, detail)
+        } else {
+            (*code, detail.as_str())
+        };
+        match code {
+            2_004_007 => Some("原生重试耗尽"),
+            // 2001005 是通用服务端错误码，详情中的 deadline 超时才进入重试。
+            2_001_005 if detail.contains("context deadline exceeded") => Some("QQ 后端查询超时"),
+            _ => None,
         }
     }
 
@@ -725,19 +751,13 @@ impl BatchMessageFetcher {
 
         let api = Arc::clone(&self.api);
         let peer_clone = peer.clone();
-        // 记录实际发出的分页大小：超时重试可能缩小 batchSize，成功后的
-        // 恢复逻辑也可能放大它，事后从 state 读回的值不一定等于本次请求值。
-        let requested_page = Arc::new(AtomicI64::new(1));
-        let requested_page_in_call = Arc::clone(&requested_page);
-        let result = self
+        let (mut messages, page) = self
             .call_with_retry(move |batch_size| {
                 let api = Arc::clone(&api);
                 let peer = peer_clone.clone();
-                let requested_page = Arc::clone(&requested_page_in_call);
                 async move {
                     let page = seq_page_size(batch_size);
-                    requested_page.store(page, Ordering::SeqCst);
-                    match anchor {
+                    let value = match anchor {
                         None => {
                             tracing::info!(
                                 "[BatchMessageFetcher] 调用 getAioFirstViewLatestMsgs API (seq 分页首批), count={page}"
@@ -751,14 +771,13 @@ impl BatchMessageFetcher {
                             api.get_msgs_by_seq_and_count(&peer, anchor, page).await
                         }
                     }
+                    .map_err(FetchError::Api)?;
+                    // issue #723：在本次尝试内校验原生响应，并返回实际使用的页宽。
+                    let messages = extract_msg_page_strict(&value)?;
+                    Ok((messages, page))
                 }
             })
             .await?;
-
-        let page = requested_page.load(Ordering::SeqCst).max(1);
-        // issue #716：原生错误（GeneralCallResult.result != 0）与无效响应必须
-        // 显式失败，不能再像空页一样按页宽跳过而静默丢消息。
-        let mut messages = extract_msg_page_strict(&result).map_err(FetchError::Api)?;
 
         // issue #716：满页时页尾边界 msgSeq 可能只返回了部分记录（count 限制
         // 的是记录条数，同一 msgSeq 可混有系统提示与普通消息）。先做包含式
@@ -814,6 +833,7 @@ impl BatchMessageFetcher {
                             api.get_msg_history(&peer, &msg_id, batch_size).await
                         }
                     }
+                    .map_err(FetchError::Api)
                 }
             })
             .await?;
@@ -873,7 +893,11 @@ impl BatchMessageFetcher {
                 let peer = peer_clone.clone();
                 let end_seq = end_seq.clone();
                 let start_seq = start_seq_owned.clone();
-                async move { api.get_msgs_by_seq_range(&peer, &end_seq, &start_seq).await }
+                async move {
+                    api.get_msgs_by_seq_range(&peer, &end_seq, &start_seq)
+                        .await
+                        .map_err(FetchError::Api)
+                }
             })
             .await?;
 
@@ -915,10 +939,10 @@ impl BatchMessageFetcher {
     ///
     /// issue #305 / #316：超时类错误下次重试自动折半 batchSize（不低于
     /// [`MIN_BATCH_SIZE_ON_TIMEOUT`]），让 QQ 客户端有机会用更小窗口完成查询。
-    async fn call_with_retry<F, Fut>(&self, api_call: F) -> Result<Value, FetchError>
+    async fn call_with_retry<F, Fut, T>(&self, api_call: F) -> Result<T, FetchError>
     where
         F: Fn(i64) -> Fut,
-        Fut: std::future::Future<Output = Result<Value, String>>,
+        Fut: std::future::Future<Output = Result<T, FetchError>>,
     {
         let mut bridge_recoveries = 0_u32;
         let mut attempt = 0_u32;
@@ -968,7 +992,7 @@ impl BatchMessageFetcher {
                     }
                     return Ok(value);
                 }
-                Ok(Err(message)) => FetchError::Api(message),
+                Ok(Err(error)) => error,
                 Err(_) => FetchError::Timeout(self.config.timeout_ms),
             };
 
@@ -982,6 +1006,15 @@ impl BatchMessageFetcher {
                 state.stats.consecutive_failures += 1;
             }
 
+            let native_retry_reason = result.native_retry_reason();
+            if matches!(
+                result,
+                FetchError::NativePage { .. } | FetchError::InvalidPage(_)
+            ) && native_retry_reason.is_none()
+            {
+                return Err(result);
+            }
+
             // issue #634：bridge / Worker 崩溃属于可恢复状态：等待 NapCat 重启
             // 并重新登录后从当前游标继续，不计入普通重试次数。
             if result.is_bridge_down() {
@@ -989,7 +1022,7 @@ impl BatchMessageFetcher {
                     return Err(result);
                 }
                 bridge_recoveries += 1;
-                self.shrink_batch_size().await;
+                self.shrink_batch_size(self.config.batch_size).await;
                 tracing::warn!(
                     "[BatchMessageFetcher] bridge 不可用（Worker 可能崩溃/重启），等待恢复后继续 (第 {bridge_recoveries}/{MAX_BRIDGE_RECOVERIES} 次)"
                 );
@@ -1007,11 +1040,16 @@ impl BatchMessageFetcher {
             // issue #305 / #316：超时类错误下次重试用更小的 batchSize。
             // issue #634：本地超时不代表 Worker 内旧查询已结束，先冷却再等
             // bridge 健康，避免重量级查询在 Worker 内叠加。
-            if result.is_timeout() {
-                self.shrink_batch_size().await;
+            if result.is_timeout() || native_retry_reason.is_some() {
+                // issue #723：从实际页宽折半，避免 batchSize 高于群聊页宽上限时原页重试。
+                let (reason, size_limit) = match native_retry_reason {
+                    Some(reason) => (reason, GROUP_SEQ_PAGE_MAX),
+                    None => ("超时", self.config.batch_size),
+                };
+                self.shrink_batch_size(size_limit).await;
                 let cooldown =
                     TIMEOUT_COOLDOWN_MS.max(self.config.retry_interval_ms * u64::from(attempt));
-                tracing::info!("[BatchMessageFetcher] 超时冷却 {cooldown}ms 后重试");
+                tracing::info!("[BatchMessageFetcher] {reason}冷却 {cooldown}ms 后重试");
                 tokio::time::sleep(Duration::from_millis(cooldown)).await;
                 if !self.wait_for_bridge_recovery().await {
                     return Err(result);
@@ -1025,12 +1063,13 @@ impl BatchMessageFetcher {
     }
 
     /// 超时 / 崩溃后自适应缩小 batchSize（不低于 [`MIN_BATCH_SIZE_ON_TIMEOUT`]）。
-    async fn shrink_batch_size(&self) {
+    async fn shrink_batch_size(&self, size_limit: i64) {
         let mut state = self.state.lock().await;
         state.consecutive_successes = 0;
-        if state.batch_size > MIN_BATCH_SIZE_ON_TIMEOUT {
+        let current = state.batch_size.min(size_limit);
+        if current > MIN_BATCH_SIZE_ON_TIMEOUT {
             let previous = state.batch_size;
-            let next = (previous / 2).max(MIN_BATCH_SIZE_ON_TIMEOUT);
+            let next = (current / 2).max(MIN_BATCH_SIZE_ON_TIMEOUT);
             state.batch_size = next;
             tracing::warn!("[BatchMessageFetcher] 自适应缩小 batchSize: {previous} -> {next}");
         }
@@ -1086,30 +1125,26 @@ impl BatchMessageFetcher {
     ) -> Result<(Vec<Value>, i64), FetchError> {
         let api = Arc::clone(&self.api);
         let peer = peer.clone();
-        let used = Arc::new(AtomicI64::new(1));
-        let used_in_call = Arc::clone(&used);
-        let value = self
-            .call_with_retry(move |batch_size| {
-                let api = Arc::clone(&api);
-                let peer = peer.clone();
-                let used = Arc::clone(&used_in_call);
-                async move {
-                    let count = seq_page_size(batch_size)
-                        .clamp(SEQ_BOUNDARY_BACKFILL_MIN_COUNT, GROUP_SEQ_PAGE_MAX);
-                    used.store(count, Ordering::SeqCst);
-                    match query {
-                        SeqBackfillQuery::Seq(seq) => {
-                            api.get_msgs_by_seq_and_count(&peer, seq, count).await
-                        }
-                        SeqBackfillQuery::MsgId(msg_id) => {
-                            api.get_msg_history(&peer, msg_id, count).await
-                        }
+        self.call_with_retry(move |batch_size| {
+            let api = Arc::clone(&api);
+            let peer = peer.clone();
+            async move {
+                let count = seq_page_size(batch_size)
+                    .clamp(SEQ_BOUNDARY_BACKFILL_MIN_COUNT, GROUP_SEQ_PAGE_MAX);
+                let value = match query {
+                    SeqBackfillQuery::Seq(seq) => {
+                        api.get_msgs_by_seq_and_count(&peer, seq, count).await
+                    }
+                    SeqBackfillQuery::MsgId(msg_id) => {
+                        api.get_msg_history(&peer, msg_id, count).await
                     }
                 }
-            })
-            .await?;
-        let messages = extract_msg_page_strict(&value).map_err(FetchError::Api)?;
-        Ok((messages, used.load(Ordering::SeqCst).max(1)))
+                .map_err(FetchError::Api)?;
+                let messages = extract_msg_page_strict(&value)?;
+                Ok((messages, count))
+            }
+        })
+        .await
     }
 
     /// issue #716：满页边界 msgSeq 的包含式补读。
@@ -1283,17 +1318,20 @@ struct SeqBoundaryBackfill {
 
 /// 从序列分页响应中提取消息列表，并拒绝把原生错误 / 无效响应当成空页。
 ///
-/// NapCat 原生调用返回 `GeneralCallResult { result: 0 | -1, errMsg }`，
-/// 业务错误不抛异常而是 `result = -1`；`msgList` 可能在顶层或包一层
+/// NapCat 原生调用通过 `GeneralCallResult { result, errMsg }` 返回业务错误码；
+/// `msgList` 可能在顶层或包一层
 /// `result` 对象内（与 `extract_msg_list` 的两种形状一致）。
-fn extract_msg_page_strict(api_result: &Value) -> Result<Vec<Value>, String> {
+fn extract_msg_page_strict(api_result: &Value) -> Result<Vec<Value>, FetchError> {
     if let Some(code) = api_result.get("result").and_then(Value::as_i64) {
         if code != 0 {
             let detail = api_result
                 .get("errMsg")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            return Err(format!("原生消息查询失败 result={code}: {detail}"));
+            return Err(FetchError::NativePage {
+                code,
+                detail: detail.to_owned(),
+            });
         }
     }
     let candidates = [
@@ -1303,12 +1341,12 @@ fn extract_msg_page_strict(api_result: &Value) -> Result<Vec<Value>, String> {
         api_result.get("result").and_then(|r| r.get("messages")),
     ];
     let Some(candidate) = candidates.into_iter().flatten().next() else {
-        return Err("响应缺少 msgList".to_string());
+        return Err(FetchError::InvalidPage("响应缺少 msgList"));
     };
     match candidate {
         Value::Array(items) => Ok(items.clone()),
         Value::Null => Ok(Vec::new()),
-        _ => Err("msgList 字段不是数组".to_string()),
+        _ => Err(FetchError::InvalidPage("msgList 字段不是数组")),
     }
 }
 
@@ -2097,12 +2135,20 @@ mod tests {
         let call_a = fetcher_a.call_with_retry(move |count| {
             let api = Arc::clone(&api_a);
             let peer = peer_a.clone();
-            async move { api.get_aio_first_view_latest_msgs(&peer, count).await }
+            async move {
+                api.get_aio_first_view_latest_msgs(&peer, count)
+                    .await
+                    .map_err(FetchError::Api)
+            }
         });
         let call_b = fetcher_b.call_with_retry(move |count| {
             let api = Arc::clone(&api_b);
             let peer = peer_b.clone();
-            async move { api.get_aio_first_view_latest_msgs(&peer, count).await }
+            async move {
+                api.get_aio_first_view_latest_msgs(&peer, count)
+                    .await
+                    .map_err(FetchError::Api)
+            }
         });
         let (a, b) = tokio::join!(call_a, call_b);
         a.expect("call a succeeds");
@@ -2567,6 +2613,118 @@ mod tests {
         expect_backfill_error(Ok(json!({ "result": -1, "errMsg": "native boom" }))).await;
         // 无效响应（缺少 msgList）。
         expect_backfill_error(Ok(json!({ "unexpected": true }))).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_retry_exhausted_retries_same_page_with_smaller_count() {
+        let api = Arc::new(SeqBoundaryMock::new(vec![("m3".to_string(), 3, 3_000)]));
+        api.script_seq(Ok(json!({
+            "result": 2_004_007,
+            "errMsg": "reach max retry time limit!",
+        })));
+        let fetcher = BatchMessageFetcher::new(
+            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+            BatchFetchConfig {
+                batch_size: 3_000,
+                retry_count: 1,
+                ..BatchFetchConfig::default()
+            },
+        );
+        let started = tokio::time::Instant::now();
+        let batch = fetcher
+            .fetch_messages(&group_peer(), &MessageFilter::default(), None, Some("3"))
+            .await
+            .expect("原生重试耗尽后应重试当前页");
+
+        assert_eq!(api.call_log(), ["seq:3:500", "seq:3:250"]);
+        assert!(started.elapsed() >= Duration::from_millis(TIMEOUT_COOLDOWN_MS));
+        assert_eq!(batch.messages[0]["msgId"], "m3");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_retry_recovers_boundary_message() {
+        let mut entries: Vec<_> = (2..=501)
+            .rev()
+            .map(|seq| (format!("m{seq}"), seq, seq * 1_000))
+            .collect();
+        entries.push(("boundary-extra".to_string(), 2, 1_000));
+        for (code, detail) in [
+            (-1, "2004007: reach max retry time limit!"),
+            (2_001_005, "Server return error!,svr-err:8 svr-msg:[backend] get failed: tcp client multiplexed transport ReadFrame: context deadline exceeded, cost: 1.00025044s"),
+            (-1, "2001005: Server return error!,svr-err:8 svr-msg:[backend] get failed: tcp client multiplexed transport ReadFrame: context deadline exceeded"),
+        ] {
+            let api = Arc::new(SeqBoundaryMock::new(entries.clone()));
+            api.script_seq(Ok(json!({ "result": code, "errMsg": detail })));
+            let fetcher = BatchMessageFetcher::new(
+                Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+                BatchFetchConfig::default(),
+            );
+            let started = tokio::time::Instant::now();
+            let batch = fetcher
+                .fetch_messages(&group_peer(), &MessageFilter::default(), None, None)
+                .await
+                .expect("边界补读应在重试后继续");
+
+            assert_eq!(api.call_log(), ["latest:500", "seq:2:500", "seq:2:250"]);
+            assert!(started.elapsed() >= Duration::from_millis(TIMEOUT_COOLDOWN_MS));
+            assert_eq!(batch.messages.len(), 501);
+            assert!(batch
+                .messages
+                .iter()
+                .any(|msg| msg["msgId"] == "boundary-extra"));
+            assert_eq!(batch.next_seq.as_deref(), Some("1"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_retry_exhausted_stops_at_existing_retry_budget() {
+        let api = Arc::new(SeqBoundaryMock::new(Vec::new()));
+        for _ in 0..2 {
+            api.script_seq(Ok(json!({
+                "result": 2_004_007,
+                "errMsg": "reach max retry time limit!",
+            })));
+        }
+        let fetcher = BatchMessageFetcher::new(
+            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+            BatchFetchConfig {
+                retry_count: 1,
+                ..BatchFetchConfig::default()
+            },
+        );
+        let error = fetcher
+            .fetch_messages(&group_peer(), &MessageFilter::default(), None, Some("3"))
+            .await
+            .expect_err("原生错误持续存在时应停止导出");
+
+        assert_eq!(api.call_log(), ["seq:3:500", "seq:3:250"]);
+        assert_eq!(
+            error.to_string(),
+            "原生消息查询失败 result=2004007: reach max retry time limit!"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_native_errors_and_invalid_pages_fail_immediately() {
+        for response in [
+            json!({ "result": 12_004_007, "errMsg": "reach max retry time limit!" }),
+            json!({ "result": 2_001_005, "errMsg": "Server return error!,svr-msg:[backend] access denied" }),
+            json!({ "result": 12_001_005, "errMsg": "context deadline exceeded" }),
+            json!({ "unexpected": true }),
+        ] {
+            let api = Arc::new(SeqBoundaryMock::new(Vec::new()));
+            api.script_seq(Ok(response));
+            let fetcher = BatchMessageFetcher::new(
+                Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+                BatchFetchConfig::default(),
+            );
+            let result = fetcher
+                .fetch_messages(&group_peer(), &MessageFilter::default(), None, Some("3"))
+                .await;
+
+            assert!(result.is_err());
+            assert_eq!(api.call_log(), ["seq:3:500"]);
+        }
     }
 
     /// issue #716：补读请求数超过上限必须显式失败（SEQUENCE_BOUNDARY_BACKFILL_EXHAUSTED）。
